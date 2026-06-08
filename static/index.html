@@ -1854,6 +1854,16 @@ async function toggleRecord(){
 
 const fmtTime = s => String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');
 
+// Convert a Blob to a base64 data URL (plain string — works in every browser/IndexedDB)
+function blobToDataUrl(blob){
+  return new Promise((res, rej) => {
+    const reader = new FileReader();
+    reader.onload  = e => res(e.target.result);
+    reader.onerror = () => rej(new Error('FileReader failed'));
+    reader.readAsDataURL(blob);
+  });
+}
+
 async function saveRecording(){
   if(!recBlob || recBlob.size < 500) return;
   const id       = Date.now();
@@ -1863,34 +1873,34 @@ async function saveRecording(){
   const sizeKB   = Math.round(recBlob.size/1024);
   const date     = new Date().toLocaleDateString();
 
-  // Always create a session URL first so the UI works immediately
+  // Create a session URL immediately so the UI works right away
   const sessionUrl = URL.createObjectURL(recBlob);
-  const light = { id, name, duration, sizeKB, date, mimeType, url: sessionUrl };
-  recHistory.unshift(light);
+  recHistory.unshift({ id, name, duration, sizeKB, date, mimeType, url: sessionUrl });
   renderHistory();
 
-  // Persist to IndexedDB as ArrayBuffer (most cross-browser compatible format)
   if(!dbAvailable){
-    toast('Recording saved for this session only — storage not available on this browser', '');
+    toast('Recording saved for this session only — storage not available on this browser','');
     return;
   }
+
   try{
-    const buffer = await recBlob.arrayBuffer();
-    await dbPut({ id, name, duration, sizeKB, date, mimeType, buffer });
-    // Verify it's actually there
+    // Store as a base64 data URL string — universally supported in IndexedDB on all browsers
+    const dataUrl = await blobToDataUrl(recBlob);
+    await dbPut({ id, name, duration, sizeKB, date, mimeType, dataUrl });
+
+    // Verify round-trip: read it back and check the string is there
     const check = await dbGet(id);
-    if(check && check.buffer){
+    if(check && check.dataUrl && check.dataUrl.length > 100){
       toast('Recording saved — still here after refresh! 💾', 'success');
     } else {
-      throw new Error('Verify failed — data not found after write');
+      throw new Error('Round-trip verify failed');
     }
   } catch(e){
     console.warn('IndexedDB save failed:', e);
-    // Mark the item in history as session-only
     const idx = recHistory.findIndex(r => r.id === id);
     if(idx > -1) recHistory[idx]._sessionOnly = true;
     renderHistory();
-    toast('Could not save to device storage — recording available this session only', '');
+    toast('Could not save to device — recording available this session only','');
   }
 }
 
@@ -1980,16 +1990,18 @@ const svgPause = () => `<svg width="13" height="13" viewBox="0 0 13 13" fill="no
 
 let curAudio=null, curPlayId=null;
 
-// Get a playable URL — use cached session URL or rebuild from IndexedDB ArrayBuffer
+// Get a playable URL — use cached session URL, or reload from stored dataUrl
 async function getRecUrl(i){
   const r = recHistory[i];
   if(r.url) return r.url;
   try{
     const stored = await dbGet(r.id);
-    if(!stored?.buffer) return null;
-    const blob = new Blob([stored.buffer], {type: stored.mimeType || 'audio/webm'});
+    if(!stored?.dataUrl) return null;
+    // dataUrl is already a valid src for Audio — but convert to blob URL for cleaner memory handling
+    const res  = await fetch(stored.dataUrl);
+    const blob = await res.blob();
     const url  = URL.createObjectURL(blob);
-    recHistory[i].url = url;   // cache for rest of session
+    recHistory[i].url = url;
     renderHistory();
     return url;
   } catch(e){ return null; }
@@ -2012,8 +2024,9 @@ async function renameRec(i, n){
   const newName = n.trim() || recHistory[i].name;
   recHistory[i].name = newName;
   try{
+    // Fetch full record (includes dataUrl) then update just the name
     const stored = await dbGet(recHistory[i].id);
-    if(stored){ stored.name = newName; await dbPut(stored); }
+    if(stored){ await dbPut({ ...stored, name: newName }); }
   } catch(e){ console.warn('Rename persist failed:', e); }
 }
 
@@ -2042,20 +2055,27 @@ const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;
 // Load all recordings from IndexedDB on startup
 async function loadHistoryFromDB(){
   try{
-    const all = await dbGetAll();
-    // Filter out any test entries
-    const real = all.filter(r => !r._test);
+    const all  = await dbGetAll();
+    const real = all.filter(r => !r._test && (r.dataUrl || r.buffer)); // support both formats
     real.sort((a,b) => b.id - a.id);
-    recHistory = real.map(r => {
-      const { buffer, ...light } = r;
-      if(buffer){
-        try{
+
+    recHistory = await Promise.all(real.map(async r => {
+      const { dataUrl, buffer, ...light } = r;
+      try{
+        if(dataUrl){
+          // Preferred: stored as base64 data URL — fetch → blob → object URL
+          const res  = await fetch(dataUrl);
+          const blob = await res.blob();
+          light.url  = URL.createObjectURL(blob);
+        } else if(buffer){
+          // Legacy: stored as ArrayBuffer (older saves)
           const blob = new Blob([buffer], {type: r.mimeType || 'audio/webm'});
           light.url  = URL.createObjectURL(blob);
-        } catch(e){ light.url = null; }
-      }
+        }
+      } catch(e){ light.url = null; }
       return light;
-    });
+    }));
+
     if(recHistory.length > 0){
       toast(`Loaded ${recHistory.length} saved recording${recHistory.length>1?'s':''} 💾`, 'success');
     }
