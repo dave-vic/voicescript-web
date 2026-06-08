@@ -1721,11 +1721,61 @@ async function copyResult(){
 }
 
 // ═══════════════════════════════════════════
+// INDEXEDDB — persistent recording storage
+// Recordings survive page refresh / tab close
+// ═══════════════════════════════════════════
+const DB_NAME = 'voicescript_db', DB_VER = 1, STORE = 'recordings';
+let db = null;
+
+function openDB(){
+  return new Promise((res, rej) => {
+    const req = indexedDB.open(DB_NAME, DB_VER);
+    req.onupgradeneeded = e => {
+      const d = e.target.result;
+      if(!d.objectStoreNames.contains(STORE))
+        d.createObjectStore(STORE, {keyPath:'id'});
+    };
+    req.onsuccess = e => { db = e.target.result; res(db); };
+    req.onerror   = e => rej(e.target.error);
+  });
+}
+function dbPut(record){
+  return new Promise((res, rej) => {
+    const tx = db.transaction(STORE, 'readwrite');
+    tx.objectStore(STORE).put(record).onsuccess = () => res();
+    tx.onerror = e => rej(e.target.error);
+  });
+}
+function dbDelete(id){
+  return new Promise((res, rej) => {
+    const tx = db.transaction(STORE, 'readwrite');
+    tx.objectStore(STORE).delete(id).onsuccess = () => res();
+    tx.onerror = e => rej(e.target.error);
+  });
+}
+function dbGetAll(){
+  return new Promise((res, rej) => {
+    const tx  = db.transaction(STORE, 'readonly');
+    const req = tx.objectStore(STORE).getAll();
+    req.onsuccess = e => res(e.target.result);
+    req.onerror   = e => rej(e.target.error);
+  });
+}
+function dbGet(id){
+  return new Promise((res, rej) => {
+    const tx  = db.transaction(STORE, 'readonly');
+    const req = tx.objectStore(STORE).get(id);
+    req.onsuccess = e => res(e.target.result);
+    req.onerror   = e => rej(e.target.error);
+  });
+}
+
+// ═══════════════════════════════════════════
 // RECORDER
 // ═══════════════════════════════════════════
 let mediaRecorder=null, recChunks=[], recSeconds=0, recTimerInt=null;
 let recMode='txt', recBlob=null;
-let recHistory = JSON.parse(localStorage.getItem('vs_hist') || '[]');
+let recHistory = [];   // populated from IndexedDB on init
 
 async function toggleRecord(){
   if(mediaRecorder && mediaRecorder.state==='recording'){ mediaRecorder.stop(); return; }
@@ -1769,18 +1819,38 @@ async function toggleRecord(){
 
 const fmtTime = s => String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');
 
-function saveRecording(){
+async function saveRecording(){
   if(!recBlob || recBlob.size < 500) return;
-  const url = URL.createObjectURL(recBlob);
-  recHistory.unshift({
-    id: Date.now(),
-    name: 'Recording — '+new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),
-    url, duration: fmtTime(recSeconds),
-    sizeKB: Math.round(recBlob.size/1024),
-    date: new Date().toLocaleDateString()
-  });
-  if(recHistory.length > 30) recHistory.pop();
-  renderHistory();
+  const id  = Date.now();
+  const meta = {
+    id,
+    name:     'Recording — '+new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),
+    duration: fmtTime(recSeconds),
+    sizeKB:   Math.round(recBlob.size/1024),
+    date:     new Date().toLocaleDateString(),
+    mimeType: recBlob.type,
+    blob:     recBlob          // stored directly in IndexedDB (handles large files)
+  };
+  try{
+    await dbPut(meta);
+    // keep in-memory list in sync (without the blob to save RAM)
+    const {blob, ...light} = meta;
+    light.url = URL.createObjectURL(recBlob);  // fresh URL for this session
+    recHistory.unshift(light);
+    if(recHistory.length > 50) recHistory.pop();
+    renderHistory();
+    toast('Recording saved — it will still be here when you come back!', 'success');
+  } catch(e){
+    // IndexedDB failed (private mode / storage full) — fall back to session URL
+    console.warn('IndexedDB save failed:', e);
+    recHistory.unshift({
+      id, name: meta.name, duration: meta.duration,
+      sizeKB: meta.sizeKB, date: meta.date,
+      url: URL.createObjectURL(recBlob)
+    });
+    renderHistory();
+    toast('Recording saved for this session only','');
+  }
 }
 
 async function transcribeRecording(){
@@ -1837,7 +1907,9 @@ function renderHistory(){
       <div class="hist-info">
         <div class="hist-name" contenteditable="true" spellcheck="false"
           onblur="renameRec(${i},this.textContent)">${esc(r.name)}</div>
-        <div class="hist-meta">${r.date} · ${r.duration} · ${r.sizeKB} KB</div>
+        <div class="hist-meta">${r.date} · ${r.duration} · ${r.sizeKB} KB
+          ${r.url ? '' : '<span style="color:var(--warn);margin-left:6px">⚠ reloading…</span>'}
+        </div>
       </div>
       <div class="hist-btns">
         <button class="hbtn hbtn-play" id="hplay-${r.id}" onclick="playRec(${i})" title="Play/Pause">
@@ -1862,35 +1934,88 @@ function renderHistory(){
   `).join('');
 }
 
-const svgPlay = () => `<svg width="13" height="13" viewBox="0 0 13 13" fill="none"><polygon points="3.5,2 11,6.5 3.5,11" fill="currentColor"/></svg>`;
+const svgPlay  = () => `<svg width="13" height="13" viewBox="0 0 13 13" fill="none"><polygon points="3.5,2 11,6.5 3.5,11" fill="currentColor"/></svg>`;
 const svgPause = () => `<svg width="13" height="13" viewBox="0 0 13 13" fill="none"><rect x="3" y="2" width="2.5" height="9" rx="1" fill="currentColor"/><rect x="7.5" y="2" width="2.5" height="9" rx="1" fill="currentColor"/></svg>`;
 
 let curAudio=null, curPlayId=null;
-function playRec(i){
+
+// Get a playable URL — use cached session URL or recreate from IndexedDB blob
+async function getRecUrl(i){
   const r = recHistory[i];
-  if(!r?.url){ toast('Recording expired — refresh and re-record','error'); return; }
+  if(r.url) return r.url;
+  // Reload blob from IndexedDB and make a fresh URL
+  try{
+    const stored = await dbGet(r.id);
+    if(!stored?.blob) return null;
+    const url = URL.createObjectURL(stored.blob);
+    recHistory[i].url = url;   // cache for rest of session
+    renderHistory();            // remove the ⚠ warning
+    return url;
+  } catch(e){ return null; }
+}
+
+async function playRec(i){
+  const url = await getRecUrl(i);
+  const r   = recHistory[i];
+  if(!url){ toast('Recording unavailable — try deleting and re-recording','error'); return; }
   if(curAudio && curPlayId===r.id){ curAudio.pause(); curAudio=null; curPlayId=null; setPlayIco(r.id,false); return; }
   if(curAudio){ curAudio.pause(); setPlayIco(curPlayId,false); }
-  curAudio = new Audio(r.url); curPlayId = r.id; setPlayIco(r.id,true);
+  curAudio = new Audio(url); curPlayId = r.id; setPlayIco(r.id,true);
   curAudio.play();
   curAudio.onended = () => { curAudio=null; curPlayId=null; setPlayIco(r.id,false); };
 }
 function setPlayIco(id,p){ const b=document.getElementById('hplay-'+id); if(b) b.innerHTML=p?svgPause():svgPlay(); }
-function renameRec(i,n){ if(recHistory[i]) recHistory[i].name=n.trim()||recHistory[i].name; }
-function deleteRec(i){
-  if(curPlayId===recHistory[i]?.id && curAudio){ curAudio.pause(); curAudio=null; curPlayId=null; }
-  recHistory.splice(i,1); renderHistory();
+
+async function renameRec(i, n){
+  if(!recHistory[i]) return;
+  const newName = n.trim() || recHistory[i].name;
+  recHistory[i].name = newName;
+  // persist the new name into IndexedDB
+  try{
+    const stored = await dbGet(recHistory[i].id);
+    if(stored){ stored.name = newName; await dbPut(stored); }
+  } catch(e){}
 }
-async function loadHistRec(i){
+
+async function deleteRec(i){
   const r = recHistory[i];
-  if(!r?.url){ toast('Recording not available','error'); return; }
-  const resp = await fetch(r.url);
+  if(!r) return;
+  if(curPlayId===r.id && curAudio){ curAudio.pause(); curAudio=null; curPlayId=null; }
+  // Remove from IndexedDB
+  try{ await dbDelete(r.id); } catch(e){}
+  recHistory.splice(i,1);
+  renderHistory();
+}
+
+async function loadHistRec(i){
+  const url = await getRecUrl(i);
+  if(!url){ toast('Recording not available','error'); return; }
+  const resp = await fetch(url);
   recBlob = await resp.blob(); recSeconds = 0;
   document.getElementById('recFileReady').style.display = 'block';
   document.getElementById('recHint').textContent = 'Loaded — choose format and transcribe';
   toast('Recording loaded','success');
 }
+
 const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+// Load all recordings from IndexedDB on startup
+async function loadHistoryFromDB(){
+  try{
+    const all = await dbGetAll();
+    // Sort newest first
+    all.sort((a,b) => b.id - a.id);
+    recHistory = all.map(r => {
+      const {blob, ...light} = r;
+      // Create fresh blob URL for this session
+      if(blob) light.url = URL.createObjectURL(blob);
+      return light;
+    });
+  } catch(e){
+    recHistory = [];
+  }
+  renderHistory();
+}
 
 // ═══════════════════════════════════════════
 // VOICE ACTIVATION
@@ -1981,7 +2106,15 @@ function stopSpeech(){ speechSynthesis.cancel(); speaking=false; document.getEle
     serverHasKey = !!cfg.has_server_key;
   } catch(e){ serverHasKey = false; }
   updateKeyUI();
-  renderHistory();
+
+  // Open IndexedDB then load saved recordings
+  try{
+    await openDB();
+    await loadHistoryFromDB();
+  } catch(e){
+    renderHistory();  // fallback: show empty
+  }
+
   speechSynthesis.onvoiceschanged = buildVoiceGrid;
   buildVoiceGrid();
 })();
