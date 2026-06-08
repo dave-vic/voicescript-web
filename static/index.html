@@ -2091,7 +2091,15 @@ async function loadHistoryFromDB(){
 // ═══════════════════════════════════════════
 const WAKE_W = ['voicescript','voice script','hey voicescript','start recording','begin','record now'];
 const STOP_W = ['stop','done','finish','end','complete','that\'s it','thats it'];
-let vaRecog=null, vaActive=false, vaRecording=false;
+let vaRecog=null, vaActive=false, vaRecording=false, vaLocked=false, vaLockTimer=null;
+
+// Lock VA command processing for `ms` milliseconds — ignores all onresult events during this time.
+// Prevents buffered/interim speech results from re-triggering after a wake or stop command.
+function lockVA(ms=2500){
+  vaLocked = true;
+  clearTimeout(vaLockTimer);
+  vaLockTimer = setTimeout(() => { vaLocked = false; }, ms);
+}
 
 function toggleVA(){
   document.getElementById('vaToggle').checked ? startVA() : stopVA();
@@ -2105,34 +2113,34 @@ function startVA(){
   const SR = window.SpeechRecognition||window.webkitSpeechRecognition;
   vaRecog = new SR(); vaRecog.continuous=true; vaRecog.interimResults=true; vaRecog.lang='en-US';
   vaRecog.onresult = e => {
-    // Only look at the LATEST result — avoids re-triggering wake word from old transcript
+    // Ignore all results during cooldown — prevents buffered speech from re-triggering
+    if(vaLocked) return;
+
+    // Only check the most recent result (not the full accumulated transcript)
     const latest = e.results[e.results.length - 1][0].transcript.toLowerCase().trim();
     document.getElementById('vaLog').textContent = 'Heard: "'+latest+'"';
 
     if(!vaRecording){
       if(WAKE_W.some(w => latest.includes(w))){
+        lockVA(2000);             // 2 s cooldown — ignore everything right after wake
         vaRecording = true;
         setVAState('recording');
         toggleRecord();
         toast('Recording started!','success');
-        // Restart recogniser with a clean slate so wake-word isn't in the next result
-        vaRecog.stop();
       }
     } else {
       if(STOP_W.some(w => latest.includes(w))){
+        lockVA(2500);             // 2.5 s cooldown — ignore everything right after stop
         vaRecording = false;
         setVAState('listening');
         if(mediaRecorder && mediaRecorder.state==='recording') mediaRecorder.stop();
         toast('Recording saved','success');
-        // Restart recogniser with a clean slate so stop-word doesn't echo back
-        vaRecog.stop();
       }
     }
   };
   vaRecog.onend = () => {
-    // Restart continuous listening if VA is still active (handles both natural end + our .stop() calls)
     if(document.getElementById('vaToggle').checked && vaActive){
-      setTimeout(() => { if(vaRecog) try{ vaRecog.start(); }catch(e){} }, 400);
+      setTimeout(() => { if(vaRecog) try{ vaRecog.start(); }catch(e){} }, 600);
     }
   };
   vaActive=true; vaRecog.start(); setVAState('listening');
