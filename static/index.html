@@ -1503,7 +1503,7 @@ let pollTimer = null;
 async function startTranscription(){
   if(!selectedFile){ toast('Choose a file first','error'); return; }
   const key = effectiveKey();
-  if(!key){ openSettings(); return; }
+  if(!serverHasKey && !key){ openSettings(); return; }
 
   const btn = document.getElementById('transcribeBtn');
   btn.disabled = true;
@@ -1848,7 +1848,7 @@ async function saveRecording(){
 async function transcribeRecording(){
   if(!recBlob){ toast('No recording yet','error'); return; }
   const key = effectiveKey();
-  if(!key){ openSettings(); return; }
+  if(!serverHasKey && !key){ openSettings(); return; }
   const ext = recBlob.type.includes('webm') ? 'webm' : 'mp4';
   const file = new File([recBlob], 'recording.'+ext, {type:recBlob.type});
   const btn = document.getElementById('transcribeRecBtn');
