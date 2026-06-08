@@ -1722,13 +1722,14 @@ async function copyResult(){
 
 // ═══════════════════════════════════════════
 // INDEXEDDB — persistent recording storage
-// Recordings survive page refresh / tab close
 // ═══════════════════════════════════════════
-const DB_NAME = 'voicescript_db', DB_VER = 1, STORE = 'recordings';
+const DB_NAME = 'voicescript_db', DB_VER = 2, STORE = 'recordings';
 let db = null;
+let dbAvailable = false;   // set to true only after a confirmed round-trip test
 
 function openDB(){
   return new Promise((res, rej) => {
+    if(!window.indexedDB){ rej(new Error('IndexedDB not supported')); return; }
     const req = indexedDB.open(DB_NAME, DB_VER);
     req.onupgradeneeded = e => {
       const d = e.target.result;
@@ -1737,27 +1738,33 @@ function openDB(){
     };
     req.onsuccess = e => { db = e.target.result; res(db); };
     req.onerror   = e => rej(e.target.error);
+    req.onblocked = e => rej(new Error('IndexedDB blocked'));
   });
 }
+
+// Wait for tx.oncomplete — guarantees data is actually written to disk
 function dbPut(record){
   return new Promise((res, rej) => {
-    const tx = db.transaction(STORE, 'readwrite');
-    tx.objectStore(STORE).put(record).onsuccess = () => res();
-    tx.onerror = e => rej(e.target.error);
+    const tx  = db.transaction(STORE, 'readwrite');
+    const req = tx.objectStore(STORE).put(record);
+    tx.oncomplete = () => res();                      // ← fully committed
+    tx.onerror    = e => rej(e.target.error);
+    req.onerror   = e => rej(e.target.error);
   });
 }
 function dbDelete(id){
   return new Promise((res, rej) => {
     const tx = db.transaction(STORE, 'readwrite');
-    tx.objectStore(STORE).delete(id).onsuccess = () => res();
-    tx.onerror = e => rej(e.target.error);
+    tx.objectStore(STORE).delete(id);
+    tx.oncomplete = () => res();
+    tx.onerror    = e => rej(e.target.error);
   });
 }
 function dbGetAll(){
   return new Promise((res, rej) => {
     const tx  = db.transaction(STORE, 'readonly');
     const req = tx.objectStore(STORE).getAll();
-    req.onsuccess = e => res(e.target.result);
+    req.onsuccess = e => res(e.target.result || []);
     req.onerror   = e => rej(e.target.error);
   });
 }
@@ -1768,6 +1775,17 @@ function dbGet(id){
     req.onsuccess = e => res(e.target.result);
     req.onerror   = e => rej(e.target.error);
   });
+}
+
+// Quick write→read test to confirm IndexedDB actually persists on this browser
+async function testDB(){
+  const TEST_ID = -1;
+  try{
+    await dbPut({ id: TEST_ID, _test: true });
+    const back = await dbGet(TEST_ID);
+    await dbDelete(TEST_ID);
+    return !!back && back._test === true;
+  } catch(e){ return false; }
 }
 
 // ═══════════════════════════════════════════
@@ -1834,14 +1852,28 @@ async function saveRecording(){
   recHistory.unshift(light);
   renderHistory();
 
-  // Now persist to IndexedDB — store as ArrayBuffer (works on ALL browsers incl. iOS Safari)
+  // Persist to IndexedDB as ArrayBuffer (most cross-browser compatible format)
+  if(!dbAvailable){
+    toast('Recording saved for this session only — storage not available on this browser', '');
+    return;
+  }
   try{
     const buffer = await recBlob.arrayBuffer();
     await dbPut({ id, name, duration, sizeKB, date, mimeType, buffer });
-    toast('Recording saved — it will still be here when you come back! 💾', 'success');
+    // Verify it's actually there
+    const check = await dbGet(id);
+    if(check && check.buffer){
+      toast('Recording saved — still here after refresh! 💾', 'success');
+    } else {
+      throw new Error('Verify failed — data not found after write');
+    }
   } catch(e){
     console.warn('IndexedDB save failed:', e);
-    toast('Recording saved for this session only (private/incognito mode detected)', '');
+    // Mark the item in history as session-only
+    const idx = recHistory.findIndex(r => r.id === id);
+    if(idx > -1) recHistory[idx]._sessionOnly = true;
+    renderHistory();
+    toast('Could not save to device storage — recording available this session only', '');
   }
 }
 
@@ -1994,16 +2026,22 @@ const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;
 async function loadHistoryFromDB(){
   try{
     const all = await dbGetAll();
-    all.sort((a,b) => b.id - a.id);
-    // Rebuild a Blob URL from each stored ArrayBuffer
-    recHistory = all.map(r => {
-      const { buffer, ...light } = r;   // strip the raw buffer from in-memory obj
+    // Filter out any test entries
+    const real = all.filter(r => !r._test);
+    real.sort((a,b) => b.id - a.id);
+    recHistory = real.map(r => {
+      const { buffer, ...light } = r;
       if(buffer){
-        const blob = new Blob([buffer], {type: r.mimeType || 'audio/webm'});
-        light.url  = URL.createObjectURL(blob);
+        try{
+          const blob = new Blob([buffer], {type: r.mimeType || 'audio/webm'});
+          light.url  = URL.createObjectURL(blob);
+        } catch(e){ light.url = null; }
       }
       return light;
     });
+    if(recHistory.length > 0){
+      toast(`Loaded ${recHistory.length} saved recording${recHistory.length>1?'s':''} 💾`, 'success');
+    }
   } catch(e){
     console.warn('Failed to load recordings from IndexedDB:', e);
     recHistory = [];
@@ -2101,12 +2139,24 @@ function stopSpeech(){ speechSynthesis.cancel(); speaking=false; document.getEle
   } catch(e){ serverHasKey = false; }
   updateKeyUI();
 
-  // Open IndexedDB then load saved recordings
+  // Open IndexedDB, run a write/read test, then load saved recordings
   try{
     await openDB();
+    dbAvailable = await testDB();
+  } catch(e){ dbAvailable = false; }
+
+  if(dbAvailable){
     await loadHistoryFromDB();
-  } catch(e){
-    renderHistory();  // fallback: show empty
+  } else {
+    renderHistory();
+    // Show a one-time notice that storage isn't working on this browser
+    const hEl = document.getElementById('recHistory');
+    const notice = document.createElement('div');
+    notice.className = 'alert alert-warn';
+    notice.style.marginBottom = '8px';
+    notice.innerHTML = '<svg class="alert-icon" width="15" height="15" viewBox="0 0 15 15" fill="none"><circle cx="7.5" cy="7.5" r="6.5" stroke="currentColor" stroke-width="1.4"/><line x1="7.5" y1="4.5" x2="7.5" y2="8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="7.5" cy="10.5" r=".8" fill="currentColor"/></svg>'
+      + ' Your browser doesn\'t support persistent storage — recordings will only last this session. Try Chrome for full support.';
+    hEl.prepend(notice);
   }
 
   speechSynthesis.onvoiceschanged = buildVoiceGrid;
