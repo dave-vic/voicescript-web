@@ -1350,11 +1350,28 @@ setTheme(getTheme());
 // ═══════════════════════════════════════════
 // API KEY  (server key takes priority)
 // ═══════════════════════════════════════════
-let serverHasKey = false;   // set by /config on load
+let serverHasKey = false;       // set by /config on load
+let configChecked = false;      // true once /config has responded at least once
 
 const getKey = () => localStorage.getItem('voicescript_key') || '';
 // The key sent to the backend: empty string = "use server default"
 const effectiveKey = () => serverHasKey ? '' : getKey();
+
+// Re-fetch /config if the initial check failed (Render cold-start race condition).
+// Returns the key to use, or null if no key is available anywhere.
+async function resolveKey(){
+  if(!configChecked){
+    try{
+      const cfg = await fetch('/config').then(r => r.json());
+      serverHasKey = !!cfg.has_server_key;
+      updateKeyUI();
+    } catch(e){}
+    configChecked = true;
+  }
+  if(serverHasKey) return '';          // server handles it — send empty string
+  const k = getKey();
+  return k || null;                    // null = nothing available → ask user
+}
 
 let keyVisible = false;
 function toggleKeyVis(){
@@ -1502,8 +1519,8 @@ let pollTimer = null;
 
 async function startTranscription(){
   if(!selectedFile){ toast('Choose a file first','error'); return; }
-  const key = effectiveKey();
-  if(!serverHasKey && !key){ openSettings(); return; }
+  const key = await resolveKey();
+  if(key === null){ openSettings(); return; }
 
   const btn = document.getElementById('transcribeBtn');
   btn.disabled = true;
@@ -1879,8 +1896,8 @@ async function saveRecording(){
 
 async function transcribeRecording(){
   if(!recBlob){ toast('No recording yet','error'); return; }
-  const key = effectiveKey();
-  if(!serverHasKey && !key){ openSettings(); return; }
+  const key = await resolveKey();
+  if(key === null){ openSettings(); return; }
   const ext = recBlob.type.includes('webm') ? 'webm' : 'mp4';
   const file = new File([recBlob], 'recording.'+ext, {type:recBlob.type});
   const btn = document.getElementById('transcribeRecBtn');
@@ -2137,6 +2154,7 @@ function stopSpeech(){ speechSynthesis.cancel(); speaking=false; document.getEle
     const cfg = await fetch('/config').then(r=>r.json());
     serverHasKey = !!cfg.has_server_key;
   } catch(e){ serverHasKey = false; }
+  configChecked = true;
   updateKeyUI();
 
   // Open IndexedDB, run a write/read test, then load saved recordings
