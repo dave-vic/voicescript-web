@@ -1,0 +1,23 @@
+# VoiceScript Web — Python dependencies
+# Install all with: pip install -r requirements.txt
+
+# ── Web framework ──────────────────────────────────────────────────────────────
+fastapi==0.115.0             # Web API framework
+uvicorn==0.30.6              # ASGI server
+python-multipart==0.0.9      # File upload support (required by FastAPI)
+
+# ── AI & Transcription ─────────────────────────────────────────────────────────
+groq==1.4.0                  # Groq API — Whisper transcription + Llama AI
+openai-whisper==20250625     # Local Whisper — speaker identification
+
+# ── Audio Processing ───────────────────────────────────────────────────────────
+pydub==0.25.1                # Audio splitting and conversion
+audioop-lts==0.2.2           # Python 3.13 compatibility fix for pydub
+
+# ── Document Generation ────────────────────────────────────────────────────────
+python-docx==1.2.0           # Generate .docx meeting notes
+
+# ── System Requirements (install separately) ───────────────────────────────────
+# ffmpeg    — audio/video conversion  →  brew install ffmpeg   (Mac)
+#                                     →  choco install ffmpeg  (Windows)
+# numpy     — speaker identification  →  pip install numpy
