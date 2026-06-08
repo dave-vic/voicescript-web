@@ -139,17 +139,24 @@ def identify_speakers(audio_path: str, language: str = None, jid: str = None) ->
     from pydub import AudioSegment
 
     if jid:
-        job_update(jid, status="Loading speaker model…", progress=68)
+        job_update(jid, status="Loading speaker model… (first run takes ~30s)", progress=65)
 
     model  = whisper.load_model("base")
+
+    if jid:
+        job_update(jid, status="Speaker model ready — analysing audio…", progress=70)
+
     kwargs = dict(word_timestamps=True, verbose=False, fp16=False)
     if language and language.strip():
         kwargs["language"] = language.strip()
 
     if jid:
-        job_update(jid, status="Analysing speakers…", progress=72)
+        job_update(jid, status="Running speaker analysis…", progress=72)
 
     result   = model.transcribe(audio_path, **kwargs)
+
+    if jid:
+        job_update(jid, status="Identifying speakers…", progress=78)
     segments = result.get("segments", [])
     if not segments:
         return []
@@ -277,7 +284,7 @@ def make_meeting_notes(transcript: str, api_key: str,
             max_tokens=600, temperature=0.2)
         summaries.append(r.choices[0].message.content.strip())
         if i < len(chunks) - 1:
-            time.sleep(8)
+            time.sleep(3)   # reduced from 8s — enough for Groq rate limits
 
     combined = "\n".join(summaries)
 
