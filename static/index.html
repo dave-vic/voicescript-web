@@ -1821,35 +1821,27 @@ const fmtTime = s => String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).p
 
 async function saveRecording(){
   if(!recBlob || recBlob.size < 500) return;
-  const id  = Date.now();
-  const meta = {
-    id,
-    name:     'Recording — '+new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),
-    duration: fmtTime(recSeconds),
-    sizeKB:   Math.round(recBlob.size/1024),
-    date:     new Date().toLocaleDateString(),
-    mimeType: recBlob.type,
-    blob:     recBlob          // stored directly in IndexedDB (handles large files)
-  };
+  const id       = Date.now();
+  const mimeType = recBlob.type || 'audio/webm';
+  const name     = 'Recording — '+new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+  const duration = fmtTime(recSeconds);
+  const sizeKB   = Math.round(recBlob.size/1024);
+  const date     = new Date().toLocaleDateString();
+
+  // Always create a session URL first so the UI works immediately
+  const sessionUrl = URL.createObjectURL(recBlob);
+  const light = { id, name, duration, sizeKB, date, mimeType, url: sessionUrl };
+  recHistory.unshift(light);
+  renderHistory();
+
+  // Now persist to IndexedDB — store as ArrayBuffer (works on ALL browsers incl. iOS Safari)
   try{
-    await dbPut(meta);
-    // keep in-memory list in sync (without the blob to save RAM)
-    const {blob, ...light} = meta;
-    light.url = URL.createObjectURL(recBlob);  // fresh URL for this session
-    recHistory.unshift(light);
-    if(recHistory.length > 50) recHistory.pop();
-    renderHistory();
-    toast('Recording saved — it will still be here when you come back!', 'success');
+    const buffer = await recBlob.arrayBuffer();
+    await dbPut({ id, name, duration, sizeKB, date, mimeType, buffer });
+    toast('Recording saved — it will still be here when you come back! 💾', 'success');
   } catch(e){
-    // IndexedDB failed (private mode / storage full) — fall back to session URL
     console.warn('IndexedDB save failed:', e);
-    recHistory.unshift({
-      id, name: meta.name, duration: meta.duration,
-      sizeKB: meta.sizeKB, date: meta.date,
-      url: URL.createObjectURL(recBlob)
-    });
-    renderHistory();
-    toast('Recording saved for this session only','');
+    toast('Recording saved for this session only (private/incognito mode detected)', '');
   }
 }
 
@@ -1939,17 +1931,17 @@ const svgPause = () => `<svg width="13" height="13" viewBox="0 0 13 13" fill="no
 
 let curAudio=null, curPlayId=null;
 
-// Get a playable URL — use cached session URL or recreate from IndexedDB blob
+// Get a playable URL — use cached session URL or rebuild from IndexedDB ArrayBuffer
 async function getRecUrl(i){
   const r = recHistory[i];
   if(r.url) return r.url;
-  // Reload blob from IndexedDB and make a fresh URL
   try{
     const stored = await dbGet(r.id);
-    if(!stored?.blob) return null;
-    const url = URL.createObjectURL(stored.blob);
+    if(!stored?.buffer) return null;
+    const blob = new Blob([stored.buffer], {type: stored.mimeType || 'audio/webm'});
+    const url  = URL.createObjectURL(blob);
     recHistory[i].url = url;   // cache for rest of session
-    renderHistory();            // remove the ⚠ warning
+    renderHistory();
     return url;
   } catch(e){ return null; }
 }
@@ -1970,11 +1962,10 @@ async function renameRec(i, n){
   if(!recHistory[i]) return;
   const newName = n.trim() || recHistory[i].name;
   recHistory[i].name = newName;
-  // persist the new name into IndexedDB
   try{
     const stored = await dbGet(recHistory[i].id);
     if(stored){ stored.name = newName; await dbPut(stored); }
-  } catch(e){}
+  } catch(e){ console.warn('Rename persist failed:', e); }
 }
 
 async function deleteRec(i){
@@ -2003,15 +1994,18 @@ const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;
 async function loadHistoryFromDB(){
   try{
     const all = await dbGetAll();
-    // Sort newest first
     all.sort((a,b) => b.id - a.id);
+    // Rebuild a Blob URL from each stored ArrayBuffer
     recHistory = all.map(r => {
-      const {blob, ...light} = r;
-      // Create fresh blob URL for this session
-      if(blob) light.url = URL.createObjectURL(blob);
+      const { buffer, ...light } = r;   // strip the raw buffer from in-memory obj
+      if(buffer){
+        const blob = new Blob([buffer], {type: r.mimeType || 'audio/webm'});
+        light.url  = URL.createObjectURL(blob);
+      }
       return light;
     });
   } catch(e){
+    console.warn('Failed to load recordings from IndexedDB:', e);
     recHistory = [];
   }
   renderHistory();
