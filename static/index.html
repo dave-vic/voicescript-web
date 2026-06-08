@@ -730,6 +730,131 @@ a { color: var(--accent); text-decoration: none; }
 ═══════════════════════════════════════════ */
 @keyframes spin { from{transform:rotate(0)} to{transform:rotate(360deg)} }
 .spin { animation: spin 1s linear infinite; }
+
+/* ═══════════════════════════════════════════
+   RESPONSIVE — TABLET  (≤768px)
+═══════════════════════════════════════════ */
+@media(max-width:768px){
+  .content { padding: 20px 16px 80px; }
+
+  .header { padding: 0 16px; }
+
+  .nav-tabs { padding: 0 8px; }
+  .nav-tab  { padding: 0 12px; font-size: 12px; }
+
+  .seg-grid { grid-template-columns: 1fr 1fr; gap: 6px; }
+
+  .result-body { max-height: 320px; font-size: 13px; }
+
+  .result-actions { gap: 6px; padding: 12px; }
+  .result-action  { padding: 7px 10px; font-size: 11px; }
+
+  .email-menu { width: 200px; }
+
+  .speed-card { gap: 10px; }
+
+  .modal { padding: 22px 18px; }
+}
+
+/* ═══════════════════════════════════════════
+   RESPONSIVE — MOBILE  (≤480px)
+═══════════════════════════════════════════ */
+@media(max-width:480px){
+  /* Header */
+  .header { padding: 0 12px; height: 54px; }
+  .logo-tag  { display: none; }          /* hide "AI" badge to save space */
+  .logo-name { font-size: 15px; }
+  .theme-toggle { width: 32px; height: 32px; }
+  .key-btn { padding: 0 10px; height: 32px; font-size: 12px; }
+
+  /* Nav */
+  .nav-tabs { padding: 0 4px; gap: 0; }
+  .nav-tab  { padding: 0 10px; height: 42px; font-size: 11px; gap: 5px; }
+  .nav-tab svg { display: none; }        /* hide tab icons on tiny screens */
+
+  /* Content */
+  .content { padding: 16px 12px 72px; }
+
+  /* Upload zone */
+  .upload-zone { padding: 28px 16px; }
+  .upload-icon { width: 44px; height: 44px; margin-bottom: 10px; }
+  .upload-zone h3 { font-size: 14px; }
+
+  /* Segment grid → single column */
+  .seg-grid { grid-template-columns: 1fr; }
+  .seg-btn  { padding: 11px 12px; }
+
+  /* Language grid → 3 columns (already set but keep) */
+  .lang-grid { grid-template-columns: repeat(3,1fr); }
+
+  /* Feature row */
+  .feature-row { padding: 12px; }
+  .feature-label { font-size: 13px; }
+
+  /* Recorder */
+  .recorder-card { padding: 24px 16px; border-radius: var(--radius-lg); }
+  .rec-timer { font-size: 42px; letter-spacing: -1px; }
+  .rec-btn   { width: 68px; height: 68px; }
+  .rec-dot   { width: 26px; height: 26px; }
+
+  /* Result */
+  .result-body { padding: 14px; font-size: 13px; max-height: 260px; }
+  .result-tabs-bar { flex-wrap: wrap; }
+  .result-tab { padding: 10px 12px; font-size: 12px; }
+  .result-tab-meta { padding: 8px 12px; font-size: 10px; }
+
+  /* Result actions — stack to two rows naturally */
+  .result-actions { padding: 10px; gap: 6px; }
+  .result-action  { padding: 8px 10px; font-size: 11px; }
+  .copy-feedback  { display: none; }    /* no room for inline feedback */
+
+  /* Email flyout — anchor to right edge on small screens */
+  .email-menu { left: auto; right: 0; width: 190px; bottom: calc(100% + 6px); }
+
+  /* Speed card — stack label + slider */
+  .speed-card { flex-wrap: wrap; gap: 8px; }
+  .speed-card input[type=range] { width: 100%; flex: unset; }
+  .speed-val  { width: auto; }
+
+  /* History item */
+  .hist-item { padding: 10px 10px; gap: 9px; }
+  .hist-thumb { width: 32px; height: 32px; }
+  .hist-name  { font-size: 12px; }
+  .hist-meta  { font-size: 10px; }
+  .hbtn       { width: 28px; height: 28px; }
+
+  /* Modal */
+  .modal-overlay { padding: 12px; align-items: flex-end; }
+  .modal {
+    border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+    padding: 20px 16px 28px;
+    max-width: 100%;
+  }
+  .modal h2 { font-size: 16px; }
+  .modal-actions { flex-direction: column; }
+  .btn-cancel { order: 2; }
+  .btn-save   { order: 1; }
+
+  /* Toast */
+  .toast { width: calc(100% - 32px); max-width: 360px; font-size: 12px; padding: 9px 14px; }
+
+  /* Action button */
+  .action-btn { height: 46px; font-size: 14px; }
+
+  /* TTS textarea */
+  .tts-textarea { min-height: 110px; }
+}
+
+/* ═══════════════════════════════════════════
+   RESPONSIVE — VERY SMALL  (≤360px)
+═══════════════════════════════════════════ */
+@media(max-width:360px){
+  .logo-name { display: none; }         /* just show the icon on 360px screens */
+  .nav-tab   { padding: 0 8px; font-size: 10px; }
+  .rec-timer { font-size: 36px; }
+  .lang-grid { grid-template-columns: repeat(3,1fr); gap: 4px; }
+  .lang-btn  { font-size: 10px; padding: 6px 2px; }
+}
 </style>
 </head>
 <body>
