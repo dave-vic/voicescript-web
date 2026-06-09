@@ -8,11 +8,12 @@ python-multipart==0.0.9      # File upload support (required by FastAPI)
 
 # ── AI & Transcription ─────────────────────────────────────────────────────────
 groq==1.4.0                  # Groq API — Whisper transcription + Llama AI
-openai-whisper==20250625     # Local Whisper — speaker identification
+                             # (No local Whisper model — saves ~150MB+ RAM on server)
 
 # ── Audio Processing ───────────────────────────────────────────────────────────
-pydub==0.25.1                # Audio splitting and conversion
+pydub==0.25.1                # Audio splitting, conversion, and speaker fingerprinting
 audioop-lts==0.2.2           # Python 3.13 compatibility fix for pydub
+numpy==1.26.4                # Speaker voice feature extraction
 
 # ── Document Generation ────────────────────────────────────────────────────────
 python-docx==1.2.0           # Generate .docx meeting notes
@@ -20,4 +21,3 @@ python-docx==1.2.0           # Generate .docx meeting notes
 # ── System Requirements (install separately) ───────────────────────────────────
 # ffmpeg    — audio/video conversion  →  brew install ffmpeg   (Mac)
 #                                     →  choco install ffmpeg  (Windows)
-# numpy     — speaker identification  →  pip install numpy

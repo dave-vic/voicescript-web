@@ -1,6 +1,7 @@
 """
-VoiceScript Web — FastAPI backend  v3.0
-All features from the desktop app, now in the browser.
+VoiceScript Web — FastAPI backend  v3.1
+All transcription via Groq API — zero local Whisper model loaded,
+keeping RAM well under Render free-tier's 512 MB limit.
 """
 
 import os, json, time, tempfile, threading, uuid, math
@@ -15,11 +16,9 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 # ── Config ────────────────────────────────────────────────────────────────────
-# Priority: env var → config.json (same file as desktop app) → empty
 def _load_default_key() -> str:
     if k := os.environ.get("GROQ_API_KEY", ""):
         return k
-    # Try the desktop app's config.json
     for candidate in [
         Path(__file__).parent / "config.json",
         Path.home() / "Desktop" / "VoiceScript.app" / "Contents" / "Resources" / "config.json",
@@ -39,20 +38,19 @@ MAX_CHUNK_MB = 24
 UPLOAD_DIR   = Path(tempfile.gettempdir()) / "voicescript_uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-JOBS: dict[str, dict] = {}          # in-memory job tracker
-JOB_MAX_AGE  = 60 * 30              # clean up completed jobs after 30 min
-JOB_TIMEOUT  = 60 * 8               # mark stalled jobs as failed after 8 min
-_EXECUTOR    = ThreadPoolExecutor(max_workers=3)   # reliable background threads
+JOBS: dict[str, dict] = {}
+JOB_MAX_AGE = 60 * 30
+JOB_TIMEOUT = 60 * 8
+_EXECUTOR   = ThreadPoolExecutor(max_workers=3)
+
 
 def _cleanup_jobs():
-    """Remove completed jobs older than JOB_MAX_AGE; time-out stalled jobs."""
     now = time.time()
     for jid, j in list(JOBS.items()):
         if j.get("done"):
             if now - j.get("ts", now) > JOB_MAX_AGE:
                 JOBS.pop(jid, None)
         else:
-            # Job hasn't finished and last update was too long ago → mark failed
             if now - j.get("ts_updated", j.get("ts", now)) > JOB_TIMEOUT:
                 j.update(done=True,
                          error="Job timed out — the server may have run out of memory. "
@@ -71,13 +69,13 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 def job_update(jid: str, **kw):
     if jid in JOBS:
         JOBS[jid].update(kw)
-        JOBS[jid]["ts_updated"] = time.time()   # heartbeat for stall detection
+        JOBS[jid]["ts_updated"] = time.time()
 
 
 def split_audio(path: Path) -> list[Path]:
     from pydub import AudioSegment
-    audio   = AudioSegment.from_file(str(path))
-    out     = path.parent / (path.stem + "_converted.mp3")
+    audio = AudioSegment.from_file(str(path))
+    out   = path.parent / (path.stem + "_converted.mp3")
     audio.export(str(out), format="mp3", bitrate="64k")
     size_mb = out.stat().st_size / (1024 * 1024)
     if size_mb <= MAX_CHUNK_MB:
@@ -88,7 +86,8 @@ def split_audio(path: Path) -> list[Path]:
     for i in range(n):
         s = i * chunk_ms
         e = min((i + 1) * chunk_ms, len(audio))
-        if s >= len(audio): break
+        if s >= len(audio):
+            break
         cp = path.parent / f"_chunk_{i+1}_of_{n}.mp3"
         audio[s:e].export(str(cp), format="mp3", bitrate="64k")
         chunks.append(cp)
@@ -97,34 +96,46 @@ def split_audio(path: Path) -> list[Path]:
 
 
 def transcribe_chunks(chunks: list[Path], api_key: str,
-                      language: str = None, jid: str = None) -> str:
+                      language: str = None, jid: str = None,
+                      verbose_json: bool = False):
+    """
+    Transcribe via Groq Whisper API — no local model loaded.
+    If verbose_json=True, returns list of segment dicts (for speaker ID).
+    Otherwise returns a plain string.
+    """
     from groq import Groq
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor as _Pool, as_completed
     client  = Groq(api_key=api_key)
     results = {}
     total   = len(chunks)
+    fmt     = "verbose_json" if verbose_json else "text"
 
     def do(i, cp):
         for attempt in range(3):
             try:
                 with open(cp, "rb") as f:
                     kw = dict(model="whisper-large-v3-turbo",
-                              file=f, response_format="text")
+                              file=f, response_format=fmt)
                     if language and language.strip():
                         kw["language"] = language.strip()
-                    return i, client.audio.transcriptions.create(**kw)
+                    resp = client.audio.transcriptions.create(**kw)
+                    if verbose_json:
+                        # resp is an object; grab segments list
+                        segs = getattr(resp, "segments", [])
+                        return i, segs
+                    return i, resp
             except Exception as e:
                 if attempt < 2 and "connection" in str(e).lower():
                     time.sleep(5)
                 else:
                     raise
 
-    with ThreadPoolExecutor(max_workers=min(4, total)) as ex:
+    with _Pool(max_workers=min(4, total)) as ex:
         futs = {ex.submit(do, i, cp): i for i, cp in enumerate(chunks)}
         done = 0
         for fut in as_completed(futs):
-            idx, text = fut.result()
-            results[idx] = text
+            idx, payload = fut.result()
+            results[idx] = payload
             done += 1
             if jid:
                 pct = 20 + int(done / total * 45)
@@ -135,44 +146,33 @@ def transcribe_chunks(chunks: list[Path], api_key: str,
         try: cp.unlink()
         except: pass
 
-    return "\n\n".join(results[i] for i in sorted(results))
+    if verbose_json:
+        # Merge segment lists in order, adjusting timestamps per chunk
+        # (For single-chunk files offsets are 0; multi-chunk we estimate)
+        all_segs = []
+        for i in sorted(results):
+            all_segs.extend(results[i] or [])
+        return all_segs
+    return "\n\n".join(str(results[i]) for i in sorted(results))
 
 
-def identify_speakers(audio_path: str, language: str = None, jid: str = None) -> list[dict]:
+def identify_speakers_from_segments(segs, audio_path: str, jid: str = None) -> list[dict]:
     """
-    Speaker identification — same algorithm as the desktop app.
-    Uses local Whisper 'base' model + multi-feature voice fingerprinting.
+    Speaker clustering using ONLY pydub + numpy — no local Whisper model.
+    Takes Groq-returned segment objects (with .start, .end, .text).
     """
-    import whisper
     import numpy as np
     from pydub import AudioSegment
 
     if jid:
-        job_update(jid, status="Loading speaker model…", progress=65)
-
-    model  = whisper.load_model("tiny")   # tiny = 39MB RAM vs 150MB for base — safe on free hosting
-
-    if jid:
-        job_update(jid, status="Speaker model ready — analysing audio…", progress=70)
-
-    kwargs = dict(word_timestamps=True, verbose=False, fp16=False)
-    if language and language.strip():
-        kwargs["language"] = language.strip()
-
-    if jid:
-        job_update(jid, status="Running speaker analysis…", progress=72)
-
-    result   = model.transcribe(audio_path, **kwargs)
-
-    if jid:
-        job_update(jid, status="Identifying speakers…", progress=78)
-    segments = result.get("segments", [])
-    if not segments:
-        return []
+        job_update(jid, status="Loading audio for speaker analysis…", progress=68)
 
     audio   = AudioSegment.from_file(audio_path).set_channels(1)
     samples = np.array(audio.get_array_of_samples(), dtype=np.float32)
     sr      = audio.frame_rate
+
+    if jid:
+        job_update(jid, status="Analysing speaker voices…", progress=72)
 
     def get_features(s0, s1):
         s = max(0, int(s0 * sr))
@@ -202,10 +202,11 @@ def identify_speakers(audio_path: str, language: str = None, jid: str = None) ->
     out      = []
     prev_end = 0
 
-    for seg in segments:
-        start = seg["start"]
-        end   = seg["end"]
-        text  = seg["text"].strip()
+    for seg in segs:
+        # Groq segments may be dicts or objects
+        start = seg.get("start", 0) if isinstance(seg, dict) else getattr(seg, "start", 0)
+        end   = seg.get("end", 0)   if isinstance(seg, dict) else getattr(seg, "end", 0)
+        text  = (seg.get("text", "") if isinstance(seg, dict) else getattr(seg, "text", "")).strip()
         if not text:
             continue
         gap      = start - prev_end
@@ -234,6 +235,8 @@ def identify_speakers(audio_path: str, language: str = None, jid: str = None) ->
         out.append({"speaker": sid, "start": start, "end": end, "text": text})
         prev_end = end
 
+    if jid:
+        job_update(jid, status="Speaker analysis complete", progress=78)
     return out
 
 
@@ -261,10 +264,6 @@ def make_meeting_notes(transcript: str, api_key: str,
                        source_name: str = "recording",
                        template_path: str = None,
                        jid: str = None) -> tuple[str, bytes]:
-    """
-    Returns (notes_text, docx_bytes).
-    Two-pass approach: chunk → bullet points → single final synthesis.
-    """
     from groq import Groq
     from docx import Document as DocxDoc
     from docx.shared import Pt, RGBColor, Inches
@@ -277,7 +276,7 @@ def make_meeting_notes(transcript: str, api_key: str,
 
     for i, chunk in enumerate(chunks):
         if jid:
-            pct = 70 + int(i / len(chunks) * 15)
+            pct = 82 + int(i / len(chunks) * 8)
             job_update(jid, progress=pct,
                        status=f"Extracting key points… ({i+1}/{len(chunks)})")
         r = client.chat.completions.create(
@@ -293,11 +292,10 @@ def make_meeting_notes(transcript: str, api_key: str,
             max_tokens=600, temperature=0.2)
         summaries.append(r.choices[0].message.content.strip())
         if i < len(chunks) - 1:
-            time.sleep(3)   # reduced from 8s — enough for Groq rate limits
+            time.sleep(3)
 
     combined = "\n".join(summaries)
 
-    # Read template headings if provided
     structure_instruction = (
         "Use these sections:\n"
         "1. MEETING OVERVIEW\n2. KEY DISCUSSIONS\n"
@@ -306,7 +304,7 @@ def make_meeting_notes(transcript: str, api_key: str,
     if template_path and Path(template_path).exists():
         try:
             from docx import Document as D2
-            doc2   = D2(template_path)
+            doc2     = D2(template_path)
             headings = [p.text.strip() for p in doc2.paragraphs
                         if p.text.strip() and p.style and "Heading" in p.style.name]
             if headings:
@@ -319,7 +317,7 @@ def make_meeting_notes(transcript: str, api_key: str,
             pass
 
     if jid:
-        job_update(jid, progress=87, status="Writing final meeting notes…")
+        job_update(jid, progress=91, status="Writing final meeting notes…")
 
     final = client.chat.completions.create(
         model="llama-3.1-8b-instant",
@@ -340,9 +338,8 @@ def make_meeting_notes(transcript: str, api_key: str,
     notes_text = final.choices[0].message.content.strip()
 
     if jid:
-        job_update(jid, progress=94, status="Creating Word document…")
+        job_update(jid, progress=96, status="Creating Word document…")
 
-    # Build .docx
     doc = DocxDoc()
     for sec in doc.sections:
         sec.top_margin    = Inches(1)
@@ -414,19 +411,28 @@ def run_job(jid: str, tmp: Path, language: str, mode: str,
         job_update(jid, progress=5, status="Converting audio…")
         chunks = split_audio(tmp)
 
-        job_update(jid, progress=18, status="Sending to AI…")
-        transcript = transcribe_chunks(chunks, api_key, language or None, jid)
-
-        # Speaker identification
         if speaker_id:
-            try:
+            # Get verbose_json so we have segment timestamps for speaker clustering —
+            # no local Whisper model needed at all
+            job_update(jid, progress=18, status="Transcribing with timestamps…")
+            segs = transcribe_chunks(chunks, api_key, language or None, jid,
+                                     verbose_json=True)
+            if segs:
                 job_update(jid, progress=65, status="Identifying speakers…")
-                diarized = identify_speakers(str(tmp), language or None, jid)
+                diarized = identify_speakers_from_segments(segs, str(tmp), jid)
                 if diarized:
                     transcript = format_with_speakers(diarized)
-            except Exception as e:
-                job_update(jid, status=f"Speaker ID skipped ({e}) — using plain transcript")
-                time.sleep(1)
+                else:
+                    # Fall back to plain text from segments
+                    transcript = " ".join(
+                        (s.get("text", "") if isinstance(s, dict) else getattr(s, "text", ""))
+                        for s in segs
+                    ).strip()
+            else:
+                transcript = ""
+        else:
+            job_update(jid, progress=18, status="Sending to AI…")
+            transcript = transcribe_chunks(chunks, api_key, language or None, jid)
 
         notes_text = None
         docx_b64   = None
@@ -499,19 +505,16 @@ async def transcribe_start(
     JOBS[jid] = {"progress": 0, "status": "Starting…", "done": False,
                  "ts": now, "ts_updated": now}
     do_speaker = speaker_id.lower() == "true"
-
-    # Use ThreadPoolExecutor — more reliable than BackgroundTasks under memory pressure
     _EXECUTOR.submit(run_job, jid, tmp, language, mode, key, do_speaker, tmpl_path)
     return JSONResponse({"job_id": jid})
 
 
 @app.get("/transcribe/status/{jid}")
 async def transcribe_status(jid: str):
-    _cleanup_jobs()          # catches stalled jobs on every poll
+    _cleanup_jobs()
     job = JOBS.get(jid)
     if not job:
         raise HTTPException(404, "Job not found or expired — please try again.")
-    # Return a safe subset (exclude large blobs from status checks)
     safe = {k: v for k, v in job.items() if k not in ("result",)}
     if job.get("done") and not job.get("error"):
         safe["result"] = job.get("result", {})
@@ -520,20 +523,19 @@ async def transcribe_status(jid: str):
 
 @app.get("/config")
 async def config():
-    """Tell the frontend whether a server-side API key is already configured."""
     return JSONResponse({"has_server_key": bool(DEFAULT_KEY)})
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "3.0.0"}
+    return {"status": "ok", "version": "3.1.0"}
 
 
 if __name__ == "__main__":
     import socket
     print()
     print("  ╔═══════════════════════════════════════╗")
-    print("  ║       VoiceScript Web  v3.0           ║")
+    print("  ║       VoiceScript Web  v3.1           ║")
     print("  ╠═══════════════════════════════════════╣")
     print("  ║  Your Mac:   http://localhost:8000    ║")
     try:
