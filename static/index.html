@@ -1585,10 +1585,25 @@ async function startTranscription(){
 
 function pollJob(jid, barId, labelId, pctId, statusId, wrapId, onReset, onDone, onErr){
   clearInterval(pollTimer);
-  let lastPct = -1, stalledFor = 0;
+  let lastPct = -1, stalledFor = 0, elapsed = 0;
+  const MAX_WAIT = 8 * 60 * 1000;   // 8 min hard timeout matches server JOB_TIMEOUT
+
   pollTimer = setInterval(async () => {
+    elapsed += 800;
+    // Hard client-side timeout
+    if(elapsed >= MAX_WAIT){
+      clearInterval(pollTimer);
+      const bar = barId ? document.getElementById(barId) : null;
+      if(bar) bar.classList.remove('stalled');
+      showProgress(wrapId, null, null, null, null, false);
+      onReset();
+      onErr('Transcription timed out. Try again with a shorter file, or turn off Speaker ID to speed things up.');
+      return;
+    }
+
     try{
       const r = await fetch('/transcribe/status/'+jid);
+      if(!r.ok){ throw new Error('Server error '+r.status); }
       const d = await r.json();
       const pct = d.progress || 0;
       const bar = barId ? document.getElementById(barId) : null;
@@ -1596,13 +1611,13 @@ function pollJob(jid, barId, labelId, pctId, statusId, wrapId, onReset, onDone, 
       if(bar) bar.style.width = pct+'%';
       if(pctId) document.getElementById(pctId).textContent = pct+'%';
 
-      // Stall detector — if progress hasn't moved in ~6s, show shimmer + reassuring label
+      // Stall detector — shimmer + reassuring message after 6 s with no movement
       if(pct === lastPct){
         stalledFor += 800;
         if(stalledFor >= 6000 && bar){
           bar.classList.add('stalled');
           if(labelId) document.getElementById(labelId).textContent =
-            (d.status || 'Processing…') + ' — still working…';
+            (d.status || 'Processing…') + ' — still working, please wait…';
         }
       } else {
         stalledFor = 0;
@@ -1620,7 +1635,9 @@ function pollJob(jid, barId, labelId, pctId, statusId, wrapId, onReset, onDone, 
         if(d.error) onErr(d.error);
         else onDone(d.result);
       }
-    } catch(e){}
+    } catch(e){
+      // Network blip — keep polling, don't abort
+    }
   }, 800);
 }
 

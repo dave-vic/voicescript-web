@@ -4,6 +4,7 @@ All features from the desktop app, now in the browser.
 """
 
 import os, json, time, tempfile, threading, uuid, math
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime
 
@@ -39,16 +40,23 @@ UPLOAD_DIR   = Path(tempfile.gettempdir()) / "voicescript_uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 JOBS: dict[str, dict] = {}          # in-memory job tracker
-JOB_MAX_AGE = 60 * 30               # clean up jobs older than 30 minutes
+JOB_MAX_AGE  = 60 * 30              # clean up completed jobs after 30 min
+JOB_TIMEOUT  = 60 * 8               # mark stalled jobs as failed after 8 min
+_EXECUTOR    = ThreadPoolExecutor(max_workers=3)   # reliable background threads
 
 def _cleanup_jobs():
-    """Remove completed jobs older than JOB_MAX_AGE seconds."""
-    import time as _time
-    now = _time.time()
-    stale = [jid for jid, j in JOBS.items()
-             if j.get("done") and now - j.get("ts", now) > JOB_MAX_AGE]
-    for jid in stale:
-        JOBS.pop(jid, None)
+    """Remove completed jobs older than JOB_MAX_AGE; time-out stalled jobs."""
+    now = time.time()
+    for jid, j in list(JOBS.items()):
+        if j.get("done"):
+            if now - j.get("ts", now) > JOB_MAX_AGE:
+                JOBS.pop(jid, None)
+        else:
+            # Job hasn't finished and last update was too long ago → mark failed
+            if now - j.get("ts_updated", j.get("ts", now)) > JOB_TIMEOUT:
+                j.update(done=True,
+                         error="Job timed out — the server may have run out of memory. "
+                               "Try again without Speaker ID, or with a shorter file.")
 
 
 app = FastAPI(title="VoiceScript Web")
@@ -63,6 +71,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 def job_update(jid: str, **kw):
     if jid in JOBS:
         JOBS[jid].update(kw)
+        JOBS[jid]["ts_updated"] = time.time()   # heartbeat for stall detection
 
 
 def split_audio(path: Path) -> list[Path]:
@@ -139,9 +148,9 @@ def identify_speakers(audio_path: str, language: str = None, jid: str = None) ->
     from pydub import AudioSegment
 
     if jid:
-        job_update(jid, status="Loading speaker model… (first run takes ~30s)", progress=65)
+        job_update(jid, status="Loading speaker model…", progress=65)
 
-    model  = whisper.load_model("base")
+    model  = whisper.load_model("tiny")   # tiny = 39MB RAM vs 150MB for base — safe on free hosting
 
     if jid:
         job_update(jid, status="Speaker model ready — analysing audio…", progress=70)
@@ -463,7 +472,6 @@ async def index():
 
 @app.post("/transcribe/start")
 async def transcribe_start(
-    background_tasks: BackgroundTasks,
     file:        UploadFile = File(...),
     language:    str        = Form(""),
     mode:        str        = Form("txt"),
@@ -486,21 +494,28 @@ async def transcribe_start(
         tp.write_bytes(await template.read())
         tmpl_path = str(tp)
 
-    _cleanup_jobs()   # evict old completed jobs
-    JOBS[jid] = {"progress": 0, "status": "Starting…", "done": False, "ts": time.time()}
+    _cleanup_jobs()
+    now = time.time()
+    JOBS[jid] = {"progress": 0, "status": "Starting…", "done": False,
+                 "ts": now, "ts_updated": now}
     do_speaker = speaker_id.lower() == "true"
 
-    background_tasks.add_task(
-        run_job, jid, tmp, language, mode, key, do_speaker, tmpl_path)
+    # Use ThreadPoolExecutor — more reliable than BackgroundTasks under memory pressure
+    _EXECUTOR.submit(run_job, jid, tmp, language, mode, key, do_speaker, tmpl_path)
     return JSONResponse({"job_id": jid})
 
 
 @app.get("/transcribe/status/{jid}")
 async def transcribe_status(jid: str):
+    _cleanup_jobs()          # catches stalled jobs on every poll
     job = JOBS.get(jid)
     if not job:
-        raise HTTPException(404, "Job not found")
-    return JSONResponse(job)
+        raise HTTPException(404, "Job not found or expired — please try again.")
+    # Return a safe subset (exclude large blobs from status checks)
+    safe = {k: v for k, v in job.items() if k not in ("result",)}
+    if job.get("done") and not job.get("error"):
+        safe["result"] = job.get("result", {})
+    return JSONResponse(safe)
 
 
 @app.get("/config")
