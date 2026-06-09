@@ -1586,7 +1586,7 @@ async function startTranscription(){
 function pollJob(jid, barId, labelId, pctId, statusId, wrapId, onReset, onDone, onErr){
   clearInterval(pollTimer);
   let lastPct = -1, stalledFor = 0, elapsed = 0;
-  const MAX_WAIT = 8 * 60 * 1000;   // 8 min hard timeout matches server JOB_TIMEOUT
+  const MAX_WAIT = 25 * 60 * 1000;  // 25 min hard timeout matches server JOB_TIMEOUT
 
   pollTimer = setInterval(async () => {
     elapsed += 800;

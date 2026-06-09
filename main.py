@@ -1,7 +1,8 @@
 """
-VoiceScript Web — FastAPI backend  v3.1
+VoiceScript Web — FastAPI backend  v3.2
 All transcription via Groq API — zero local Whisper model loaded,
 keeping RAM well under Render free-tier's 512 MB limit.
+Long-file safe: speaker audio loaded at 8 kHz to cap RAM usage.
 """
 
 import os, json, time, tempfile, threading, uuid, math
@@ -39,9 +40,10 @@ UPLOAD_DIR   = Path(tempfile.gettempdir()) / "voicescript_uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 JOBS: dict[str, dict] = {}
-JOB_MAX_AGE = 60 * 30
-JOB_TIMEOUT = 60 * 8
-_EXECUTOR   = ThreadPoolExecutor(max_workers=3)
+JOB_MAX_AGE  = 60 * 60        # keep completed jobs 1 hour
+JOB_TIMEOUT  = 60 * 25        # allow 25 min for long files (Groq + LLM notes)
+MAX_UPLOAD_MB = 200            # reject files over 200 MB with a clear message
+_EXECUTOR    = ThreadPoolExecutor(max_workers=3)
 
 
 def _cleanup_jobs():
@@ -53,8 +55,9 @@ def _cleanup_jobs():
         else:
             if now - j.get("ts_updated", j.get("ts", now)) > JOB_TIMEOUT:
                 j.update(done=True,
-                         error="Job timed out — the server may have run out of memory. "
-                               "Try again without Speaker ID, or with a shorter file.")
+                         error="Processing timed out after 25 minutes. "
+                               "Try turning off Speaker ID for faster processing, "
+                               "or split the audio into shorter clips.")
 
 
 app = FastAPI(title="VoiceScript Web")
@@ -160,6 +163,8 @@ def identify_speakers_from_segments(segs, audio_path: str, jid: str = None) -> l
     """
     Speaker clustering using ONLY pydub + numpy — no local Whisper model.
     Takes Groq-returned segment objects (with .start, .end, .text).
+    Audio is downsampled to 8 kHz before loading into numpy to cap RAM:
+      25-min audio @ 44.1 kHz = ~265 MB; @ 8 kHz = ~48 MB — safe on free tier.
     """
     import numpy as np
     from pydub import AudioSegment
@@ -167,9 +172,13 @@ def identify_speakers_from_segments(segs, audio_path: str, jid: str = None) -> l
     if jid:
         job_update(jid, status="Loading audio for speaker analysis…", progress=68)
 
-    audio   = AudioSegment.from_file(audio_path).set_channels(1)
+    # Downsample to 8 kHz mono — enough for voice fingerprinting, ~5× less RAM
+    SPEAKER_SR = 8000
+    audio   = (AudioSegment.from_file(audio_path)
+               .set_channels(1)
+               .set_frame_rate(SPEAKER_SR))
     samples = np.array(audio.get_array_of_samples(), dtype=np.float32)
-    sr      = audio.frame_rate
+    sr      = SPEAKER_SR
 
     if jid:
         job_update(jid, status="Analysing speaker voices…", progress=72)
@@ -489,10 +498,21 @@ async def transcribe_start(
     if not key:
         raise HTTPException(400, "No API key. Add your free Groq key in Settings.")
 
-    suffix = Path(file.filename).suffix.lower() or ".mp3"
-    jid    = str(uuid.uuid4())[:8]
-    tmp    = UPLOAD_DIR / f"upload_{jid}{suffix}"
-    tmp.write_bytes(await file.read())
+    suffix   = Path(file.filename).suffix.lower() or ".mp3"
+    jid      = str(uuid.uuid4())[:8]
+    tmp      = UPLOAD_DIR / f"upload_{jid}{suffix}"
+    raw      = await file.read()
+
+    # Reject files that are too large before wasting memory
+    size_mb = len(raw) / (1024 * 1024)
+    if size_mb > MAX_UPLOAD_MB:
+        raise HTTPException(
+            413,
+            f"File is {size_mb:.0f} MB — please keep uploads under {MAX_UPLOAD_MB} MB. "
+            f"Compress or trim the audio first."
+        )
+    tmp.write_bytes(raw)
+    del raw   # free memory immediately after writing to disk
 
     tmpl_path = None
     if template and template.filename:
@@ -528,7 +548,7 @@ async def config():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "3.1.0"}
+    return {"status": "ok", "version": "3.2.0"}
 
 
 if __name__ == "__main__":
